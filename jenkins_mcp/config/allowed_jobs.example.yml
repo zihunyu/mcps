@@ -1,0 +1,27 @@
+jobs:
+  app-prod:
+    display_name: App Production Release
+    jenkins_path: release-folder/app-prod-release
+    description: Release the app service to production.
+    required_params:
+      - VERSION
+      - ENV
+    allowed_params:
+      - VERSION
+      - ENV
+      - CANARY
+      - CHANGE_ID
+    parameter_options:
+      ENV:
+        - prod
+        - staging
+
+  app-staging:
+    display_name: App Staging Release
+    jenkins_path: release-folder/app-staging-release
+    description: Release the app service to staging.
+    required_params:
+      - VERSION
+    allowed_params:
+      - VERSION
+      - CHANGE_ID
