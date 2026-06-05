@@ -1,0 +1,20 @@
+center:
+  base_url: "http://127.0.0.1:8000"
+  api_token: "center-api-token"
+  timeout_seconds: 10
+  poll_interval_seconds: 1
+  poll_timeout_seconds: 30
+mcp:
+  transport: "stdio"
+  host: "127.0.0.1"
+  port: 8081
+  log_level: "INFO"
+auth:
+  bearer_token: "mcp-bearer-token"
+limits:
+  default_lines: 200
+  max_lines: 5000
+download:
+  dir: "./downloads"
+  public_base_url: "http://127.0.0.1:8081"
+  token_ttl_seconds: 1800

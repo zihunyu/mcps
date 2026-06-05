@@ -1,0 +1,22 @@
+services:
+  log-center:
+    build: .
+    command: ["python", "center_run.py"]
+    environment:
+      LOG_CENTER_CONFIG: /app/center/config.yaml
+    volumes:
+      - ./center/config.yaml:/app/center/config.yaml:ro
+    ports:
+      - "8000:8000"
+
+  log-mcp:
+    build: .
+    command: ["python", "run.py"]
+    depends_on:
+      - log-center
+    environment:
+      LOG_MCP_CONFIG: /app/mcp/config.yaml
+    volumes:
+      - ./mcp/config.compose.yaml:/app/mcp/config.yaml:ro
+    ports:
+      - "8081:8081"

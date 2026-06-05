@@ -1,0 +1,6 @@
+INFO application started
+INFO health check ok
+ERROR database connection failed
+INFO retrying database connection
+ERROR retry database connection failed
+INFO request finished

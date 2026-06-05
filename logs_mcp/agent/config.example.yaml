@@ -1,0 +1,15 @@
+server_id: "local-demo-01"
+hostname: "local-demo-01"
+ip: "127.0.0.1"
+env: "dev"
+center:
+  base_url: "http://127.0.0.1:8000"
+  agent_token: "agent-token"
+  timeout_seconds: 10
+allow_logs:
+  - name: "demo-log"
+    path: "./demo_logs/app.log"
+runtime:
+  heartbeat_interval_seconds: 10
+  task_poll_interval_seconds: 3
+  log_level: "INFO"

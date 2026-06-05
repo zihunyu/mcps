@@ -1,0 +1,10 @@
+server:
+  host: "127.0.0.1"
+  port: 8000
+  log_level: "info"
+auth:
+  api_token: "center-api-token"
+  agent_token: "agent-token"
+limits:
+  default_lines: 200
+  max_lines: 5000

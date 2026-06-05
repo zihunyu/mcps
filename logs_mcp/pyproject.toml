@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "log-mcp"
+version = "0.1.0"
+description = "FastMCP server for querying logs through Log Center API."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.109,<1.0",
+    "httpx>=0.28,<1.0",
+    "mcp>=1.27,<2.0",
+    "pydantic>=2.0,<3.0",
+    "PyYAML>=6.0,<7.0",
+    "uvicorn>=0.31,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+log-mcp = "log_mcp.server:main"
+log-center = "log_center.server:main"
+log-agent = "log_agent.worker:main"
+
+[tool.setuptools]
+packages = ["log_mcp", "log_center", "log_agent"]
+package-dir = {log_mcp = "mcp/log_mcp", log_center = "center/log_center", log_agent = "agent/log_agent"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["mcp", "center", "agent"]
