@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import httpx
 
 from .config import AgentSettings
@@ -32,7 +34,7 @@ class AgentClient:
             ip=self._settings.ip,
             env=self._settings.env,
             logs=[
-                HeartbeatLog(name=log.name, path=str(log.path))
+                build_heartbeat_log(log.name, log.path)
                 for log in self._settings.allow_logs
             ],
         )
@@ -47,3 +49,23 @@ class AgentClient:
     async def upload_result(self, result: TaskResultRequest) -> None:
         response = await self._client.post("/api/agent/task/result", json=result.model_dump())
         response.raise_for_status()
+
+
+def build_heartbeat_log(name: str, path: object) -> HeartbeatLog:
+    """Build heartbeat metadata for an allow-listed log."""
+
+    log_path = path
+    exists = bool(log_path.exists())  # type: ignore[attr-defined]
+    size_bytes: int | None = None
+    modified_at: str | None = None
+    if exists and log_path.is_file():  # type: ignore[attr-defined]
+        stat = log_path.stat()  # type: ignore[attr-defined]
+        size_bytes = stat.st_size
+        modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return HeartbeatLog(
+        name=name,
+        path=str(log_path),
+        exists=exists,
+        size_bytes=size_bytes,
+        modified_at=modified_at,
+    )

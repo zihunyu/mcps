@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from datetime import timedelta
 from threading import RLock
 from uuid import uuid4
 
@@ -27,8 +28,15 @@ def utc_now() -> datetime:
 class InMemoryStore:
     """Thread-safe in-memory Center store."""
 
-    def __init__(self, max_lines: int) -> None:
+    def __init__(
+        self,
+        max_lines: int,
+        running_timeout_seconds: float = 300,
+        server_offline_after_seconds: float = 60,
+    ) -> None:
         self._max_lines = max_lines
+        self._running_timeout = timedelta(seconds=running_timeout_seconds)
+        self._server_offline_after = timedelta(seconds=server_offline_after_seconds)
         self._servers: dict[str, ServerRecord] = {}
         self._logs: dict[tuple[str, str], LogFileRecord] = {}
         self._tasks: dict[str, TaskRecord] = {}
@@ -62,21 +70,35 @@ class InMemoryStore:
                     server_id=server_id,
                     log_name=log.name,
                     log_path=log.path,
+                    exists=log.exists,
+                    size_bytes=log.size_bytes,
+                    modified_at=log.modified_at,
                     enabled=True,
                     created_at=current_log.created_at if current_log else now,
                 )
 
     def list_servers(self) -> list[ServerInfo]:
         with self._lock:
+            now = utc_now()
             return [
-                ServerInfo(server_id=server.server_id, env=server.env, status=server.status)
+                ServerInfo(
+                    server_id=server.server_id,
+                    env=server.env,
+                    status="offline" if now - server.last_heartbeat > self._server_offline_after else "online",
+                    last_heartbeat=server.last_heartbeat,
+                )
                 for server in sorted(self._servers.values(), key=lambda item: item.server_id)
             ]
 
     def list_logs(self, server_id: str) -> list[LogFileInfo]:
         with self._lock:
             return [
-                LogFileInfo(log_name=log.log_name)
+                LogFileInfo(
+                    log_name=log.log_name,
+                    exists=log.exists,
+                    size_bytes=log.size_bytes,
+                    modified_at=log.modified_at,
+                )
                 for log in sorted(self._logs.values(), key=lambda item: item.log_name)
                 if log.server_id == server_id and log.enabled
             ]
@@ -105,12 +127,14 @@ class InMemoryStore:
     def fetch_tasks(self, server_id: str) -> list[AgentTask]:
         with self._lock:
             now = utc_now()
+            self._recover_timed_out_running_tasks(now)
             fetched: list[AgentTask] = []
             for task in self._tasks.values():
                 if task.server_id != server_id or task.status != "pending":
                     continue
                 task.status = "running"
                 task.updated_at = now
+                task.run_started_at = now
                 fetched.append(
                     AgentTask(
                         task_id=task.task_id,
@@ -133,6 +157,7 @@ class InMemoryStore:
 
     def get_task_result(self, task_id: str) -> TaskResultResponse:
         with self._lock:
+            self._recover_timed_out_running_tasks(utc_now())
             task = self._tasks.get(task_id)
             if task is None:
                 raise KeyError(f"task not found: {task_id}")
@@ -142,3 +167,13 @@ class InMemoryStore:
                 lines=task.result_lines,
                 error=task.error,
             )
+
+    def _recover_timed_out_running_tasks(self, now: datetime) -> None:
+        for task in self._tasks.values():
+            if task.status != "running":
+                continue
+            started_at = task.run_started_at or task.updated_at
+            if now - started_at > self._running_timeout:
+                task.status = "pending"
+                task.run_started_at = None
+                task.updated_at = now

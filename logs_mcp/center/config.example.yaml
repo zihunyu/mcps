@@ -8,3 +8,5 @@ auth:
 limits:
   default_lines: 200
   max_lines: 5000
+  running_timeout_seconds: 300
+  server_offline_after_seconds: 60

@@ -18,3 +18,5 @@ download:
   dir: "/app/downloads"
   public_base_url: "http://127.0.0.1:8081"
   token_ttl_seconds: 1800
+  retention_seconds: 86400
+  max_total_size_mb: 1024

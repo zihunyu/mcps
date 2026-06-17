@@ -27,7 +27,11 @@ def create_app(settings: CenterSettings) -> FastAPI:
     """Create the Log Center API app."""
 
     app = FastAPI(title="Log Center", version="0.1.0")
-    store = InMemoryStore(max_lines=settings.limits.max_lines)
+    store = InMemoryStore(
+        max_lines=settings.limits.max_lines,
+        running_timeout_seconds=settings.limits.running_timeout_seconds,
+        server_offline_after_seconds=settings.limits.server_offline_after_seconds,
+    )
 
     def require_api_token(authorization: Annotated[str | None, Header()] = None) -> None:
         require_bearer_token(authorization, settings.auth.api_token)

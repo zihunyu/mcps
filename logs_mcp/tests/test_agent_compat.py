@@ -14,6 +14,7 @@ if str(AGENT_COMPAT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_COMPAT_DIR))
 
 from log_agent_compat.config import load_config  # noqa: E402
+from log_agent_compat.client import build_heartbeat_log  # noqa: E402
 from log_agent_compat.reader import read_tail_lines  # noqa: E402
 from log_agent_compat.worker import get_allowed_log_path, run_once  # noqa: E402
 
@@ -82,6 +83,18 @@ allow_logs:
 
     with pytest.raises(PermissionError, match="allow_logs"):
         get_allowed_log_path(settings, "other-log")
+
+
+def test_agent_compat_heartbeat_log_reports_file_metadata(tmp_path: Path) -> None:
+    log_file = tmp_path / "app.log"
+    log_file.write_text("INFO ok\n", encoding="utf-8")
+
+    result = build_heartbeat_log("demo-log", log_file)
+
+    assert result["name"] == "demo-log"
+    assert result["exists"] is True
+    assert result["size_bytes"] == log_file.stat().st_size
+    assert result["modified_at"].endswith("Z")
 
 
 def test_agent_compat_once_cycle_with_center(tmp_path: Path, unused_tcp_port: int) -> None:

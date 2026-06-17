@@ -83,6 +83,8 @@ class DownloadConfig(BaseModel):
     dir: Path = Field(default=Path("./downloads"))
     public_base_url: str = Field(default="http://127.0.0.1:8081", min_length=1)
     token_ttl_seconds: int = Field(default=1800, gt=0)
+    retention_seconds: int = Field(default=86400, gt=0)
+    max_total_size_mb: int = Field(default=1024, gt=0)
 
     @field_validator("public_base_url")
     @classmethod

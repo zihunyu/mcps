@@ -39,10 +39,12 @@ def test_center_compat_registers_agent_and_completes_task() -> None:
     assert heartbeat.status_code == 200
 
     servers = client.get("/api/log/servers", headers=api_headers)
-    assert servers.json == [{"server_id": "local-demo-01", "env": None, "status": "online"}]
+    assert servers.json[0]["server_id"] == "local-demo-01"
+    assert servers.json[0]["status"] == "online"
+    assert servers.json[0]["last_heartbeat"] is not None
 
     logs = client.get("/api/log/server/local-demo-01/files", headers=api_headers)
-    assert logs.json == [{"log_name": "demo-log"}]
+    assert logs.json == [{"log_name": "demo-log", "exists": None, "size_bytes": None, "modified_at": None}]
 
     created = client.post(
         "/api/log/task",

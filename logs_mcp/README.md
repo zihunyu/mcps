@@ -50,11 +50,13 @@ Log Agent
 
 ## MCP 工具
 
-本服务注册 4 个 MCP 工具：
+本服务注册 6 个 MCP 工具：
 
 ```text
+diagnose_log_mcp
 list_log_servers
 list_server_logs
+search_logs
 read_log
 download_log
 ```
@@ -69,20 +71,26 @@ python run.py --list-tools
 
 ```text
 Registered MCP tools:
+- diagnose_log_mcp
 - list_log_servers
 - list_server_logs
+- search_logs
 - read_log
 - download_log
 ```
 
 工具说明：
 
-- `list_log_servers()`：查询已注册服务器列表。
-- `list_server_logs(server_id)`：查询指定服务器的日志列表。
+- `diagnose_log_mcp()`：检查 MCP 配置、Center 连通性、下载目录和下载 URL 可用性。
+- `list_log_servers()`：查询已注册服务器列表，返回在线状态和最后心跳时间。
+- `list_server_logs(server_id)`：查询指定服务器的日志列表，返回日志是否存在、大小、修改时间等元信息。
+- `search_logs(keyword=None, server_id=None)`：只搜索服务器和日志名称，不读取日志正文。
 - `read_log(server_id, log_name, lines=200, keyword=None)`：查询指定服务器、指定日志的最近 N 行，可选关键字过滤。
 - `download_log(server_id, log_name, lines=200, keyword=None)`：查询指定日志并保存到 MCP 本地文件，只返回文件路径、临时下载 URL、过期时间、行数、文件大小等元信息，不返回日志正文。
 
 `read_log` 会把日志正文直接返回给 MCP 客户端，日志越多，消耗 token 越多。大量日志推荐使用 `download_log`，它只下载不分析；只有你明确要求分析某个下载文件时，才读取文件内容进行分析。`download_log` 返回的 `download_url` 只有在 Log MCP 以 HTTP 可访问方式运行时才可用，例如 `streamable-http`。
+
+关键字过滤语义：Agent 会先读取指定日志的最后 N 行，再在这 N 行内按 `keyword` 过滤。它不是“从整个日志中找到最近 N 行匹配 keyword 的内容”。
 
 ## 本机完整演示
 
@@ -138,6 +146,7 @@ Agent 启动后会：
 - 向 Center 发送心跳。
 - 上报 `local-demo-01` 服务器。
 - 上报 `demo-log` 日志文件。
+- 上报日志文件是否存在、文件大小、最后修改时间。
 - 每 3 秒拉取一次任务。
 - 读取 `allow_logs` 中允许的日志文件并回传结果。
 
@@ -255,6 +264,8 @@ auth:
 limits:
   default_lines: 200
   max_lines: 5000
+  running_timeout_seconds: 300
+  server_offline_after_seconds: 60
 ```
 
 启动：
@@ -354,6 +365,8 @@ download:
   dir: "./downloads"
   public_base_url: "http://<mcp-ip>:8081"
   token_ttl_seconds: 1800
+  retention_seconds: 86400
+  max_total_size_mb: 1024
 ```
 
 stdio 启动：
@@ -414,6 +427,7 @@ http://<mcp-ip>:8081/downloads/<token>
 ```
 
 `token_ttl_seconds` 默认 1800 秒，也就是 30 分钟。token 保存在 Log MCP 进程内存中，MCP 重启后旧 URL 会失效，但已下载到 `download.dir` 的文件仍会保留。
+`retention_seconds` 和 `max_total_size_mb` 用于清理 MCP 本地下载文件，避免下载目录无限增长。
 
 ### 4. 可选：部署低版本兼容 Center
 
@@ -474,6 +488,9 @@ http://127.0.0.1:8081
 - `download_log` 只把日志保存为 MCP 本地文件，不自动分析，也不返回日志正文。
 - `auth.bearer_token` 保护 MCP HTTP 接口，避免未授权客户端调用 MCP 工具。
 - `download_url` 使用临时随机 token，有效期由 `download.token_ttl_seconds` 控制，默认 30 分钟；下载链接不再要求额外 Bearer 请求头。
+- MCP 会按 `download.retention_seconds` 和 `download.max_total_size_mb` 清理本地下载文件。
+- Center 会按 `limits.server_offline_after_seconds` 判断 Agent 离线状态。
+- Center 会按 `limits.running_timeout_seconds` 恢复长时间未回传的 running 任务。
 - `download_url` 不替代权限控制，生产环境建议只在可信网络、VPN 或反向代理鉴权后暴露 Log MCP HTTP 服务。
 - `lines` 最大值为 5000。
 

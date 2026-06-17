@@ -1,6 +1,7 @@
 """HTTP client for the Python 3.6 compatible Log Agent."""
 
 import json
+from datetime import datetime, timezone
 from urllib import parse, request
 
 
@@ -15,7 +16,7 @@ class AgentClient(object):
             "ip": self._settings.ip,
             "env": self._settings.env,
             "logs": [
-                {"name": log.name, "path": str(log.path)}
+                build_heartbeat_log(log.name, log.path)
                 for log in self._settings.allow_logs
             ],
         }
@@ -49,3 +50,16 @@ class AgentClient(object):
         if not raw:
             return None
         return json.loads(raw.decode("utf-8"))
+
+
+def build_heartbeat_log(name, path):
+    exists = path.exists()
+    payload = {"name": name, "path": str(path), "exists": bool(exists)}
+    if exists and path.is_file():
+        stat = path.stat()
+        payload["size_bytes"] = stat.st_size
+        payload["modified_at"] = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")
+    else:
+        payload["size_bytes"] = None
+        payload["modified_at"] = None
+    return payload

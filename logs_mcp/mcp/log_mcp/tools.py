@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
 from starlette.requests import Request
@@ -13,7 +15,7 @@ from starlette.responses import FileResponse, PlainTextResponse, Response
 
 from .client import CenterClient, CenterClientError
 from .config import AppConfig
-from .downloads import DownloadRegistry, save_downloaded_log
+from .downloads import DownloadRegistry, cleanup_downloads, save_downloaded_log
 from .models import CreateTaskRequest, DownloadLogResponse, ReadLogResponse, ToolError
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,11 @@ def create_mcp_server(
     )
     make_client = client_factory or (lambda: CenterClient(config.center))
     download_registry = DownloadRegistry(config.download.token_ttl_seconds)
+    cleanup_downloads(
+        config.download.dir,
+        config.download.retention_seconds,
+        config.download.max_total_size_mb,
+    )
 
     @mcp.custom_route("/downloads/{token}", methods=["GET"], include_in_schema=False)
     async def download_saved_log(request: Request) -> Response:
@@ -56,6 +63,101 @@ def create_mcp_server(
             filename=record.file_name,
             media_type="text/plain",
         )
+
+    @mcp.tool()
+    async def diagnose_log_mcp() -> dict[str, Any]:
+        """Diagnose Log MCP configuration and Log Center connectivity."""
+
+        logger.info("tool_call tool=diagnose_log_mcp")
+        center_status: dict[str, Any] = {"ok": False}
+        try:
+            async with make_client() as client:
+                servers = await client.list_servers()
+            center_status = {"ok": True, "server_count": len(servers)}
+        except Exception as exc:
+            center_status = {"ok": False, "error": str(exc)}
+
+        download_dir = config.download.dir.expanduser().resolve()
+        download_dir.mkdir(parents=True, exist_ok=True)
+        public_base_url = config.download.public_base_url
+        public_base_url_reachable = await _check_public_base_url(public_base_url)
+        cleanup_result = cleanup_downloads(
+            config.download.dir,
+            config.download.retention_seconds,
+            config.download.max_total_size_mb,
+        )
+        result = {
+            "mcp": {
+                "transport": config.mcp.transport,
+                "host": config.mcp.host,
+                "port": config.mcp.port,
+                "bearer_token_enabled": bool(config.auth.bearer_token),
+            },
+            "center": center_status,
+            "download": {
+                "dir": str(download_dir),
+                "dir_exists": download_dir.exists(),
+                "public_base_url": public_base_url,
+                "public_base_url_reachable": public_base_url_reachable,
+                "download_url_may_work": config.mcp.transport != "stdio" and public_base_url_reachable,
+                "token_ttl_seconds": config.download.token_ttl_seconds,
+                "retention_seconds": config.download.retention_seconds,
+                "max_total_size_mb": config.download.max_total_size_mb,
+                "cleanup": cleanup_result,
+            },
+            "notes": [
+                "download_url uses its own temporary token and does not require MCP bearer header",
+                "keyword filtering reads the last requested lines first, then filters within those lines",
+            ],
+        }
+        logger.info(
+            "tool_result tool=diagnose_log_mcp center_ok=%s download_url_may_work=%s",
+            center_status["ok"],
+            result["download"]["download_url_may_work"],
+        )
+        return result
+
+    @mcp.tool()
+    async def search_logs(keyword: str | None = None, server_id: str | None = None) -> dict[str, Any]:
+        """Search registered server IDs and log names without reading log content."""
+
+        normalized_keyword = keyword.strip().lower() if keyword else None
+        normalized_server_id = server_id.strip() if server_id else None
+        logger.info(
+            "tool_call tool=search_logs server_id=%s keyword_present=%s",
+            normalized_server_id,
+            bool(normalized_keyword),
+        )
+        try:
+            async with make_client() as client:
+                servers = await client.list_servers()
+                matches: list[dict[str, Any]] = []
+                for server in servers:
+                    if normalized_server_id and server.server_id != normalized_server_id:
+                        continue
+                    logs = await client.list_server_logs(server.server_id)
+                    server_matches_keyword = (
+                        normalized_keyword is not None and normalized_keyword in server.server_id.lower()
+                    )
+                    for log in logs:
+                        log_matches_keyword = (
+                            normalized_keyword is None or normalized_keyword in log.log_name.lower()
+                        )
+                        if server_matches_keyword or log_matches_keyword:
+                            matches.append(
+                                {
+                                    "server_id": server.server_id,
+                                    "server_status": server.status,
+                                    "log_name": log.log_name,
+                                    "exists": log.exists,
+                                    "size_bytes": log.size_bytes,
+                                    "modified_at": log.modified_at,
+                                }
+                            )
+            logger.info("tool_result tool=search_logs count=%s", len(matches))
+            return {"matches": matches, "count": len(matches)}
+        except Exception as exc:
+            return _tool_error("search_logs", exc)
 
     @mcp.tool()
     async def list_log_servers() -> list[dict[str, Any]] | dict[str, str]:
@@ -164,6 +266,11 @@ def create_mcp_server(
             if result.status != "finished":
                 raise CenterClientError(f"Task {result.task_id} ended with status {result.status}")
 
+            cleanup_downloads(
+                config.download.dir,
+                config.download.retention_seconds,
+                config.download.max_total_size_mb,
+            )
             file_path, size_bytes = save_downloaded_log(
                 config.download.dir,
                 request.server_id,
@@ -176,6 +283,7 @@ def create_mcp_server(
                 size_bytes=size_bytes,
             )
             download_url = f"{config.download.public_base_url}/downloads/{download_record.token}"
+            created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
             logger.info(
                 (
@@ -193,8 +301,13 @@ def create_mcp_server(
             return DownloadLogResponse(
                 task_id=result.task_id,
                 status=result.status,
+                server_id=request.server_id,
+                log_name=request.log_name,
+                keyword_present=bool(request.keyword),
+                created_at=created_at,
                 file_path=str(file_path),
                 download_url=download_url,
+                download_url_requires_header=False,
                 expires_at=download_record.expires_at_iso,
                 line_count=len(result.lines),
                 size_bytes=size_bytes,
@@ -203,6 +316,15 @@ def create_mcp_server(
             return _tool_error("download_log", exc)
 
     return mcp
+
+
+async def _check_public_base_url(public_base_url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=2) as client:
+            response = await client.get(public_base_url)
+        return response.status_code < 500
+    except Exception:
+        return False
 
 
 def _tool_error(tool_name: str, exc: Exception) -> dict[str, str]:

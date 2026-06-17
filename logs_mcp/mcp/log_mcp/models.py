@@ -18,6 +18,7 @@ class ServerInfo(BaseModel):
     server_id: str
     env: str | None = None
     status: str | None = None
+    last_heartbeat: str | None = None
 
 
 class LogFileInfo(BaseModel):
@@ -26,6 +27,9 @@ class LogFileInfo(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     log_name: str
+    exists: bool | None = None
+    size_bytes: int | None = None
+    modified_at: str | None = None
 
 
 class CreateTaskRequest(BaseModel):
@@ -91,8 +95,13 @@ class DownloadLogResponse(BaseModel):
 
     task_id: str
     status: str
+    server_id: str
+    log_name: str
+    keyword_present: bool
+    created_at: str
     file_path: str
     download_url: str
+    download_url_requires_header: bool
     expires_at: str
     line_count: int
     size_bytes: int

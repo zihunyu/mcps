@@ -42,6 +42,8 @@ class LimitsConfig(BaseModel):
 
     default_lines: int = Field(default=200, ge=1)
     max_lines: int = Field(default=5000, ge=1)
+    running_timeout_seconds: float = Field(default=300, gt=0)
+    server_offline_after_seconds: float = Field(default=60, gt=0)
 
 
 class CenterSettings(BaseModel):

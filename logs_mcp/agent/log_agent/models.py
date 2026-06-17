@@ -15,6 +15,9 @@ class HeartbeatLog(BaseModel):
 
     name: str
     path: str
+    exists: bool | None = None
+    size_bytes: int | None = None
+    modified_at: str | None = None
 
 
 class HeartbeatRequest(BaseModel):

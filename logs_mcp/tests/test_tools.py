@@ -17,6 +17,7 @@ from log_mcp.server import main
 class FakeCenterClient:
     last_request: CreateTaskRequest | None = None
     result_status: str = "finished"
+    fail_list_servers: bool = False
 
     async def __aenter__(self) -> "FakeCenterClient":
         return self
@@ -25,10 +26,19 @@ class FakeCenterClient:
         return None
 
     async def list_servers(self) -> list[ServerInfo]:
+        if self.fail_list_servers:
+            raise RuntimeError("center unavailable")
         return [ServerInfo(server_id="prod-app-01", env="prod", status="online")]
 
     async def list_server_logs(self, server_id: str) -> list[LogFileInfo]:
-        return [LogFileInfo(log_name=f"{server_id}-app-log")]
+        return [
+            LogFileInfo(
+                log_name=f"{server_id}-app-log",
+                exists=True,
+                size_bytes=123,
+                modified_at="2026-06-05T00:00:00Z",
+            )
+        ]
 
     async def read_log(self, request: CreateTaskRequest) -> TaskResult:
         self.last_request = request
@@ -72,7 +82,14 @@ async def test_list_server_logs_tool() -> None:
 
     result = await call_tool(server, "list_server_logs", {"server_id": "prod-app-01"})
 
-    assert result == [{"log_name": "prod-app-01-app-log"}]
+    assert result == [
+        {
+            "log_name": "prod-app-01-app-log",
+            "exists": True,
+            "size_bytes": 123,
+            "modified_at": "2026-06-05T00:00:00Z",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -123,6 +140,11 @@ async def test_download_log_tool_saves_file_without_returning_lines(tmp_path: Pa
     assert file_path.read_text(encoding="utf-8") == "ERROR xxx\n"
     assert result["task_id"] == "task-001"
     assert result["status"] == "finished"
+    assert result["server_id"] == "prod-app-01"
+    assert result["log_name"] == "app-error"
+    assert result["keyword_present"] is True
+    assert result["download_url_requires_header"] is False
+    assert result["created_at"].endswith("Z")
     assert result["download_url"].startswith("http://mcp.local:8081/downloads/")
     assert result["expires_at"].endswith("Z")
     assert result["line_count"] == 1
@@ -232,3 +254,31 @@ def test_list_tools_cli_outputs_registered_tools(
     assert "list_server_logs" in output
     assert "read_log" in output
     assert "download_log" in output
+    assert "diagnose_log_mcp" in output
+    assert "search_logs" in output
+
+
+@pytest.mark.asyncio
+async def test_search_logs_matches_registered_logs(tmp_path: Path) -> None:
+    fake = FakeCenterClient()
+    server = create_mcp_server(make_app_config(tmp_path), client_factory=lambda: fake)  # type: ignore[arg-type]
+
+    result = await call_tool(server, "search_logs", {"keyword": "app-log"})
+
+    assert result["count"] == 1
+    assert result["matches"][0]["server_id"] == "prod-app-01"
+    assert result["matches"][0]["log_name"] == "prod-app-01-app-log"
+    assert result["matches"][0]["exists"] is True
+
+
+@pytest.mark.asyncio
+async def test_diagnose_log_mcp_reports_center_error(tmp_path: Path) -> None:
+    fake = FakeCenterClient()
+    fake.fail_list_servers = True
+    server = create_mcp_server(make_app_config(tmp_path), client_factory=lambda: fake)  # type: ignore[arg-type]
+
+    result = await call_tool(server, "diagnose_log_mcp")
+
+    assert result["center"]["ok"] is False
+    assert "center unavailable" in result["center"]["error"]
+    assert result["download"]["download_url_may_work"] is False

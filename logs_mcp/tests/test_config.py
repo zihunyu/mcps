@@ -25,6 +25,8 @@ download:
   dir: "./downloads"
   public_base_url: "http://mcp.local:8081/"
   token_ttl_seconds: 1800
+  retention_seconds: 86400
+  max_total_size_mb: 1024
 """,
         encoding="utf-8",
     )
@@ -42,6 +44,8 @@ def test_load_config_from_explicit_path(tmp_path: Path) -> None:
     assert config.auth.bearer_token == "mcp-token"
     assert config.download.public_base_url == "http://mcp.local:8081"
     assert config.download.token_ttl_seconds == 1800
+    assert config.download.retention_seconds == 86400
+    assert config.download.max_total_size_mb == 1024
 
 
 def test_load_config_from_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

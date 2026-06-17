@@ -12,7 +12,11 @@ logger = logging.getLogger(__name__)
 
 def create_app(settings):
     app = Flask(__name__)
-    store = InMemoryStore(max_lines=settings.limits.max_lines)
+    store = InMemoryStore(
+        max_lines=settings.limits.max_lines,
+        running_timeout_seconds=settings.limits.running_timeout_seconds,
+        server_offline_after_seconds=settings.limits.server_offline_after_seconds,
+    )
 
     @app.route("/api/agent/heartbeat", methods=["POST"])
     def heartbeat():
@@ -128,6 +132,9 @@ def validate_logs(logs):
             {
                 "name": required_text(item.get("name"), "logs.name"),
                 "path": required_text(item.get("path"), "logs.path"),
+                "exists": item.get("exists"),
+                "size_bytes": item.get("size_bytes"),
+                "modified_at": item.get("modified_at"),
             }
         )
     return validated

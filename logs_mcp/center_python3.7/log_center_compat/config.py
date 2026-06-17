@@ -24,9 +24,23 @@ class AuthConfig(object):
 
 
 class LimitsConfig(object):
-    def __init__(self, default_lines=200, max_lines=5000):
+    def __init__(
+        self,
+        default_lines=200,
+        max_lines=5000,
+        running_timeout_seconds=300,
+        server_offline_after_seconds=60,
+    ):
         self.default_lines = _positive_int(default_lines, "limits.default_lines")
         self.max_lines = _positive_int(max_lines, "limits.max_lines")
+        self.running_timeout_seconds = _positive_float(
+            running_timeout_seconds,
+            "limits.running_timeout_seconds",
+        )
+        self.server_offline_after_seconds = _positive_float(
+            server_offline_after_seconds,
+            "limits.server_offline_after_seconds",
+        )
         if self.max_lines < self.default_lines:
             raise ValueError("limits.max_lines must be >= limits.default_lines")
 
@@ -80,6 +94,8 @@ def load_config(path=None):
         limits=LimitsConfig(
             default_lines=limits_raw.get("default_lines", 200),
             max_lines=limits_raw.get("max_lines", 5000),
+            running_timeout_seconds=limits_raw.get("running_timeout_seconds", 300),
+            server_offline_after_seconds=limits_raw.get("server_offline_after_seconds", 60),
         ),
     )
 
@@ -107,6 +123,16 @@ def _positive_int(value, name):
         raise ValueError("{0} must be a positive integer".format(name))
     if number < 1:
         raise ValueError("{0} must be >= 1".format(name))
+    return number
+
+
+def _positive_float(value, name):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("{0} must be a positive number".format(name))
+    if number <= 0:
+        raise ValueError("{0} must be > 0".format(name))
     return number
 
 

@@ -115,8 +115,65 @@ def save_downloaded_log(
     return file_path, file_path.stat().st_size
 
 
+def cleanup_downloads(
+    download_dir: Path,
+    retention_seconds: int,
+    max_total_size_mb: int,
+) -> dict[str, int]:
+    """Remove old or excessive downloaded logs under the configured directory."""
+
+    root = download_dir.expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    retention = timedelta(seconds=retention_seconds)
+    removed_files = 0
+    removed_bytes = 0
+    files: list[tuple[Path, float, int]] = []
+
+    for file_path in root.rglob("*.log"):
+        if not file_path.is_file():
+            continue
+        resolved_path = file_path.resolve()
+        if not resolved_path.is_relative_to(root):
+            continue
+        stat = resolved_path.stat()
+        modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        if now - modified_at > retention:
+            size = stat.st_size
+            resolved_path.unlink(missing_ok=True)
+            removed_files += 1
+            removed_bytes += size
+            continue
+        files.append((resolved_path, stat.st_mtime, stat.st_size))
+
+    max_total_size = max_total_size_mb * 1024 * 1024
+    total_size = sum(size for _, _, size in files)
+    for file_path, _, size in sorted(files, key=lambda item: item[1]):
+        if total_size <= max_total_size:
+            break
+        file_path.unlink(missing_ok=True)
+        total_size -= size
+        removed_files += 1
+        removed_bytes += size
+
+    _remove_empty_dirs(root)
+    return {"removed_files": removed_files, "removed_bytes": removed_bytes}
+
+
 def sanitize_path_part(value: str) -> str:
     """Return a filesystem-safe path segment."""
 
     cleaned = SAFE_NAME_PATTERN.sub("_", value.strip()).strip("._-")
     return cleaned or "unnamed"
+
+
+def _remove_empty_dirs(root: Path) -> None:
+    for directory in sorted(
+        (path for path in root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            continue

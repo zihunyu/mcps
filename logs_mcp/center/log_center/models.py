@@ -16,6 +16,9 @@ class AgentLogFile(BaseModel):
 
     name: str
     path: str
+    exists: bool | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
+    modified_at: datetime | None = None
 
     @field_validator("name", "path")
     @classmethod
@@ -62,6 +65,9 @@ class LogFileRecord(BaseModel):
     server_id: str
     log_name: str
     log_path: str
+    exists: bool | None = None
+    size_bytes: int | None = None
+    modified_at: datetime | None = None
     enabled: bool = True
     created_at: datetime
 
@@ -72,12 +78,16 @@ class ServerInfo(BaseModel):
     server_id: str
     env: str | None = None
     status: str
+    last_heartbeat: datetime | None = None
 
 
 class LogFileInfo(BaseModel):
     """Public log file response."""
 
     log_name: str
+    exists: bool | None = None
+    size_bytes: int | None = None
+    modified_at: datetime | None = None
 
 
 class CreateTaskRequest(BaseModel):
@@ -150,6 +160,7 @@ class TaskRecord(BaseModel):
     error: str | None = None
     created_at: datetime
     updated_at: datetime
+    run_started_at: datetime | None = None
 
 
 class TaskResultResponse(BaseModel):
