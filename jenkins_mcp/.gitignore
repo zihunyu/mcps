@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+.jenkins_release_tasks.jsonl
 
 config/allowed_jobs.yml
 

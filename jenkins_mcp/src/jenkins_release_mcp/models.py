@@ -159,6 +159,8 @@ class BackgroundReleaseTask(BaseModel):
     job_name: str
     module: str | None = None
     params: dict[str, str] = Field(default_factory=dict)
+    lock_key: str | None = None
+    notify_to: list[str] = Field(default_factory=list)
     created_at: str
     updated_at: str
     queue_url: str | None = None

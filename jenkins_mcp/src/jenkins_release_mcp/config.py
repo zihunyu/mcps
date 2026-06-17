@@ -99,6 +99,7 @@ class JenkinsSettings(BaseModel):
     jobs: dict[str, ReleaseJobConfig]
     request_timeout_seconds: float = 30.0
     verify_ssl: bool = True
+    release_tasks_file: Path = Path(".jenkins_release_tasks.jsonl")
     mcp_bearer_token: str | None = None
     smtp: "SmtpSettings" = Field(default_factory=lambda: SmtpSettings())
 
@@ -152,6 +153,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> JenkinsSettings:
     api_token = _required_env(env, "JENKINS_API_TOKEN")
 
     allowed_jobs_file = Path(env.get("JENKINS_ALLOWED_JOBS_FILE", "config/allowed_jobs.yml"))
+    release_tasks_file = Path(env.get("JENKINS_RELEASE_TASKS_FILE", ".jenkins_release_tasks.jsonl"))
     request_timeout_seconds = _float_env(env, "JENKINS_REQUEST_TIMEOUT_SECONDS", 30.0)
     verify_ssl = _bool_env(env, "JENKINS_VERIFY_SSL", True)
     mcp_bearer_token = _optional_env(env, "MCP_BEARER_TOKEN")
@@ -166,6 +168,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> JenkinsSettings:
         jobs=jobs,
         request_timeout_seconds=request_timeout_seconds,
         verify_ssl=verify_ssl,
+        release_tasks_file=release_tasks_file,
         mcp_bearer_token=mcp_bearer_token,
         smtp=smtp,
     )

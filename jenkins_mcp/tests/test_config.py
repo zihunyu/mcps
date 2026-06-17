@@ -105,6 +105,25 @@ def test_load_settings_reads_smtp_config(tmp_path: Path) -> None:
     assert settings.smtp.recipients == ["a@example.com", "b@example.com"]
     assert settings.smtp.is_configured() is True
     assert settings.mcp_bearer_token == "secret-token"
+    assert settings.release_tasks_file == Path(".jenkins_release_tasks.jsonl")
+
+
+def test_load_settings_reads_release_tasks_file(tmp_path: Path) -> None:
+    jobs_file = tmp_path / "jobs.yml"
+    tasks_file = tmp_path / "tasks.jsonl"
+    write_jobs(jobs_file)
+
+    settings = load_settings(
+        {
+            "JENKINS_URL": "https://jenkins.example.com",
+            "JENKINS_USER": "bot",
+            "JENKINS_API_TOKEN": "token",
+            "JENKINS_ALLOWED_JOBS_FILE": str(jobs_file),
+            "JENKINS_RELEASE_TASKS_FILE": str(tasks_file),
+        }
+    )
+
+    assert settings.release_tasks_file == tasks_file
 
 
 def test_validate_release_request_normalizes_allowed_params(tmp_path: Path) -> None:

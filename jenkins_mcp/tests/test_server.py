@@ -17,7 +17,13 @@ from jenkins_release_mcp.models import (
     WaitBuildResult,
 )
 from jenkins_release_mcp.server import ReleaseRuntime
-from jenkins_release_mcp.server import BearerTokenMiddleware, build_release_email_body, build_release_email_subject
+from jenkins_release_mcp.server import (
+    BearerTokenMiddleware,
+    build_release_email_body,
+    build_release_email_subject,
+    redact_params,
+    summarize_failure_log,
+)
 
 
 def make_settings(tmp_path: Path):
@@ -45,6 +51,7 @@ jobs:
             "JENKINS_USER": "bot",
             "JENKINS_API_TOKEN": "token",
             "JENKINS_ALLOWED_JOBS_FILE": str(jobs_file),
+            "JENKINS_RELEASE_TASKS_FILE": str(tmp_path / "release_tasks.jsonl"),
         }
     )
 
@@ -175,6 +182,35 @@ class FlakyStatusClient(FakeClient):
         if self.status_calls == 1:
             raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
         return await super().get_build_status(job_name, job, build_number)
+
+
+class RecentReleaseClient(FakeClient):
+    async def list_recent_releases(self, job_name: str, job: Any, limit: int = 10):
+        from jenkins_release_mcp.models import (
+            RecentReleaseItem,
+            RecentReleaseParameter,
+            RecentReleasesResult,
+        )
+
+        return RecentReleasesResult(
+            job_name=job_name,
+            releases=[
+                RecentReleaseItem(
+                    build_number=2,
+                    building=False,
+                    result="FAILURE",
+                    build_url="https://jenkins.example.com/job/app/2/",
+                    parameters=[RecentReleaseParameter(name="models", value="service-web")],
+                ),
+                RecentReleaseItem(
+                    build_number=1,
+                    building=False,
+                    result="SUCCESS",
+                    build_url="https://jenkins.example.com/job/app/1/",
+                    parameters=[RecentReleaseParameter(name="models", value="service-api")],
+                ),
+            ],
+        )
 
 
 def test_list_release_jobs(tmp_path: Path) -> None:
@@ -400,9 +436,43 @@ def test_wait_release_and_notify_failure_includes_log(tmp_path: Path) -> None:
         )
 
         assert result["wait"]["result"] == "FAILURE"
-        assert result["failure_log_excerpt"] == "failed build output"
+        assert "failed build output" in result["failure_log_excerpt"]
 
     asyncio.run(run())
+
+
+def test_summarize_failure_log_prefers_keyword_context() -> None:
+    text = "\n".join(
+        [
+            "line 1",
+            "line 2",
+            "compile step",
+            "ERROR failed to compile module",
+            "line 5",
+            "line 6",
+            "tail line",
+        ]
+    )
+
+    result = summarize_failure_log(text, max_chars=200)
+
+    assert "失败关键词上下文" in result
+    assert "ERROR failed to compile module" in result
+    assert "日志尾部" in result
+
+
+def test_redact_params_hides_sensitive_values() -> None:
+    assert redact_params(
+        {
+            "models": "service-api",
+            "deploy_token": "secret-value",
+            "PASSWORD": "pass",
+        }
+    ) == {
+        "models": "service-api",
+        "deploy_token": "***REDACTED***",
+        "PASSWORD": "***REDACTED***",
+    }
 
 
 def test_release_and_notify_background_returns_task_and_completes(tmp_path: Path) -> None:
@@ -432,6 +502,36 @@ def test_release_and_notify_background_returns_task_and_completes(tmp_path: Path
         assert task["build_number"] == 45
         assert task["branch"]["branch"] == "release/test"
         assert task["notification"]["sent"] is False
+        assert task["lock_key"] == "job=app-prod|module=service-api"
+
+    asyncio.run(run())
+
+
+def test_release_tasks_are_persisted_and_replayed(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = make_settings(tmp_path)
+        fake = FakeClient()
+        runtime = ReleaseRuntime(settings=settings, client_factory=lambda _: fake)
+
+        result = await runtime.release_and_notify_background(
+            "app-prod",
+            {"models": "service-api"},
+            confirm=True,
+            timeout_seconds=5,
+            poll_interval_seconds=0.01,
+        )
+        task_id = result["task"]["task_id"]
+        for _ in range(50):
+            task = runtime.get_release_task(task_id)["task"]
+            if task["status"] == "success":
+                break
+            await asyncio.sleep(0.02)
+
+        reloaded = ReleaseRuntime(settings=settings, client_factory=lambda _: fake)
+
+        task = reloaded.get_release_task(task_id)["task"]
+        assert task["status"] == "success"
+        assert task["params"] == {"models": "service-api"}
 
     asyncio.run(run())
 
@@ -451,7 +551,122 @@ def test_release_and_notify_background_requires_confirm(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
-def test_list_release_tasks_returns_recent_tasks(tmp_path: Path) -> None:
+def test_start_release_requires_exact_confirm_text(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = make_settings(tmp_path)
+        fake = FakeClient()
+        runtime = ReleaseRuntime(settings=settings, client_factory=lambda _: fake)
+
+        with pytest.raises(ValueError, match="confirm_text"):
+            await runtime.start_release(
+                "app-prod",
+                "service-api",
+                confirm_text="确认",
+            )
+
+        assert fake.trigger_calls == []
+
+    asyncio.run(run())
+
+
+def test_start_release_triggers_background_task_with_notify_override(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = make_settings(tmp_path)
+        fake = FakeClient()
+        runtime = ReleaseRuntime(settings=settings, client_factory=lambda _: fake)
+
+        result = await runtime.start_release(
+            "app-prod",
+            "service-api",
+            notify_to="owner@example.com,ops@example.com",
+            confirm_text="确认发版 app-prod service-api",
+            timeout_seconds=5,
+            poll_interval_seconds=0.01,
+        )
+
+        task_id = result["task"]["task_id"]
+        assert result["task"]["notify_to"] == ["owner@example.com", "ops@example.com"]
+        for _ in range(50):
+            task = runtime.get_release_task(task_id)["task"]
+            if task["status"] == "success":
+                break
+            await asyncio.sleep(0.02)
+
+        task = runtime.get_release_task(task_id)["task"]
+        assert task["notification"]["recipients"] == ["owner@example.com", "ops@example.com"]
+
+    asyncio.run(run())
+
+
+def test_start_release_rejects_unknown_module(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = make_settings(tmp_path)
+        runtime = ReleaseRuntime(settings=settings, client_factory=lambda _: FakeClient())
+
+        with pytest.raises(Exception, match="not allowed"):
+            await runtime.start_release(
+                "app-prod",
+                "missing",
+                confirm_text="确认发版 app-prod missing",
+            )
+
+    asyncio.run(run())
+
+
+def test_background_release_rejects_duplicate_active_task(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = make_settings(tmp_path)
+        runtime = ReleaseRuntime(settings=settings, client_factory=lambda _: FakeClient())
+
+        await runtime.release_and_notify_background(
+            "app-prod",
+            {"models": "service-api"},
+            confirm=True,
+            timeout_seconds=5,
+            poll_interval_seconds=10,
+        )
+
+        with pytest.raises(ValueError, match="already active"):
+            await runtime.release_and_notify_background(
+                "app-prod",
+                {"models": "service-api"},
+                confirm=True,
+                timeout_seconds=5,
+                poll_interval_seconds=10,
+            )
+
+    asyncio.run(run())
+
+
+def test_background_release_force_allows_duplicate_active_task(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = make_settings(tmp_path)
+        fake = FakeClient()
+        runtime = ReleaseRuntime(settings=settings, client_factory=lambda _: fake)
+
+        await runtime.release_and_notify_background(
+            "app-prod",
+            {"models": "service-api"},
+            confirm=True,
+            timeout_seconds=5,
+            poll_interval_seconds=10,
+        )
+        result = await runtime.release_and_notify_background(
+            "app-prod",
+            {"models": "service-api"},
+            confirm=True,
+            timeout_seconds=5,
+            poll_interval_seconds=10,
+            force=True,
+        )
+
+        assert result["task"]["status"] == "queued"
+        assert len(fake.trigger_calls) == 2
+
+    asyncio.run(run())
+
+
+def test_list_release_tasks_returns_recent_tasks_and_filters(tmp_path: Path) -> None:
     async def run() -> None:
         settings = make_settings(tmp_path)
         fake = FakeClient()
@@ -465,9 +680,10 @@ def test_list_release_tasks_returns_recent_tasks(tmp_path: Path) -> None:
             poll_interval_seconds=0.01,
         )
 
-        tasks = runtime.list_release_tasks()["tasks"]
+        tasks = runtime.list_release_tasks(module="service-api", status="queued")["tasks"]
         assert len(tasks) == 1
         assert tasks[0]["job_name"] == "app-prod"
+        assert runtime.list_release_tasks(module="service-web")["tasks"] == []
 
     asyncio.run(run())
 
@@ -496,5 +712,22 @@ def test_background_task_retries_transient_jenkins_disconnect(tmp_path: Path) ->
         task = runtime.get_release_task(task_id)["task"]
         assert task["status"] == "success"
         assert fake.status_calls >= 2
+
+    asyncio.run(run())
+
+
+def test_list_recent_releases_filters_by_module_and_result(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = make_settings(tmp_path)
+        runtime = ReleaseRuntime(settings=settings, client_factory=lambda _: RecentReleaseClient())
+
+        result = await runtime.list_recent_releases(
+            "app-prod",
+            module="service-api",
+            result="success",
+        )
+
+        assert len(result["releases"]) == 1
+        assert result["releases"][0]["build_number"] == 1
 
     asyncio.run(run())

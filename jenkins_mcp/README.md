@@ -60,6 +60,7 @@ JENKINS_URL=https://jenkins.example.com
 JENKINS_USER=release-bot
 JENKINS_API_TOKEN=replace-with-api-token
 JENKINS_ALLOWED_JOBS_FILE=config/allowed_jobs.yml
+JENKINS_RELEASE_TASKS_FILE=.jenkins_release_tasks.jsonl
 ```
 
 如果你不想用 `.env`，也可以直接在 PowerShell 里设置环境变量：
@@ -76,6 +77,7 @@ $env:JENKINS_ALLOWED_JOBS_FILE="config/allowed_jobs.yml"
 ```powershell
 $env:JENKINS_REQUEST_TIMEOUT_SECONDS="30"
 $env:JENKINS_VERIFY_SSL="true"
+$env:JENKINS_RELEASE_TASKS_FILE=".jenkins_release_tasks.jsonl"
 $env:MCP_HTTP_HOST="127.0.0.1"
 $env:MCP_HTTP_PORT="8000"
 ```
@@ -105,6 +107,9 @@ SMTP_USE_SSL=true
 ```
 
 注意：`SMTP_PASSWORD` 填 QQ 邮箱的 SMTP 授权码，不是 QQ 登录密码。
+
+`start_release`、`wait_release_and_notify` 和 `wait_multi_module_release_and_notify`
+都支持传 `notify_to` 覆盖本次邮件收件人；不传时使用 `.env` 里的 `SMTP_TO`。
 
 如果你的配置文件不叫 `.env`，可以这样指定：
 
@@ -515,6 +520,7 @@ Dry-run：
   "job_name": "app-prod",
   "queue_id": 123,
   "module": "service-web",
+  "notify_to": "owner@example.com,ops@example.com",
   "timeout_seconds": 1800
 }
 ```
@@ -549,6 +555,33 @@ Dry-run：
 }
 ```
 
+失败时会优先提取 Jenkins 日志中包含 `ERROR`、`Exception`、`Traceback`、
+`BUILD FAILURE`、`FAILED`、`npm ERR`、`Maven failure` 的上下文，并附带日志尾部摘要。
+
+### start_release
+
+推荐使用的一键后台发版入口。它会触发单模块发版，立刻返回本地 `task_id`，
+然后 MCP 服务在后台等待 Jenkins 完成并发送邮件。
+
+```json
+{
+  "job_name": "app-prod",
+  "module": "service-web",
+  "notify_to": "owner@example.com",
+  "confirm_text": "确认发版 app-prod service-web",
+  "timeout_seconds": 1800,
+  "poll_interval_seconds": 5
+}
+```
+
+安全规则：
+
+- `confirm_text` 必须精确等于 `确认发版 {job_name} {module}`。
+- 模块值必须在 `parameter_options.models` 白名单里。
+- 同一个 `job_name + module` 已有后台任务处于 `triggering`、`queued`、`running`、
+  `retrying`、`finishing` 时，会拒绝重复触发。
+- 如确实需要重复触发，可传 `force=true`。
+
 ### release_and_notify_background
 
 触发发版后立刻返回本地后台任务 ID，MCP 服务会在后台继续监控 Jenkins，并在完成后发送邮件。Codex 不需要保持工具调用等待。
@@ -560,9 +593,11 @@ Dry-run：
     "models": "service-web"
   },
   "module": "service-web",
+  "notify_to": "owner@example.com",
   "confirm": true,
   "timeout_seconds": 1800,
-  "poll_interval_seconds": 5
+  "poll_interval_seconds": 5,
+  "force": false
 }
 ```
 
@@ -579,7 +614,10 @@ Dry-run：
 }
 ```
 
-注意：后台任务状态保存在 MCP 服务进程内。重启 MCP 服务后，本地任务记录会消失，但已经触发的 Jenkins 构建不会被取消。
+后台任务会追加写入 `JENKINS_RELEASE_TASKS_FILE` 指定的 JSONL 文件，默认是
+`.jenkins_release_tasks.jsonl`。MCP 服务重启后会恢复最新任务状态，用于查询和重复发版锁判断。
+当前版本不会在重启后自动重新接管未完成的 Jenkins 构建；已经触发的 Jenkins 构建不会被取消。
+写入 JSONL 的参数会自动脱敏常见敏感字段，例如 `token`、`password`、`secret`、`key`、`credential`。
 
 ### get_release_task
 
@@ -591,15 +629,18 @@ Dry-run：
 }
 ```
 
-常见状态：`queued`、`running`、`success`、`failed`、`error`。
+常见状态：`triggering`、`queued`、`running`、`retrying`、`finishing`、`success`、`failed`、`cancelled`、`error`。
 
 ### list_release_tasks
 
-查看当前 MCP 服务进程内最近的后台发版任务。
+查看当前 MCP 服务最近的后台发版任务。支持按任务、模块和状态过滤。
 
 ```json
 {
-  "limit": 20
+  "limit": 20,
+  "job_name": "app-prod",
+  "module": "service-web",
+  "status": "success"
 }
 ```
 
@@ -622,6 +663,7 @@ Dry-run：
       "queue_id": 124
     }
   ],
+  "notify_to": "owner@example.com",
   "timeout_seconds": 1800
 }
 ```
@@ -633,11 +675,14 @@ Dry-run：
 ```json
 {
   "job_name": "app-prod",
-  "limit": 10
+  "limit": 10,
+  "module": "service-web",
+  "result": "SUCCESS"
 }
 ```
 
-返回构建号、状态、开始时间、耗时、构建地址和 Jenkins 参数。
+返回构建号、状态、开始时间、耗时、构建地址和 Jenkins 参数。`module` 会匹配 Jenkins 参数
+`models`，`result` 可用 `SUCCESS`、`FAILURE`、`ABORTED` 等 Jenkins 结果值。
 
 返回中的 `next_offset` 可以用于下一次继续读取：
 
@@ -664,9 +709,11 @@ Dry-run：
 
 如果希望 Codex 不持续等待，可以使用后台闭环流程：
 
-1. 调用 `release_and_notify_background`，它会立刻返回 `task_id`。
+1. 优先调用 `start_release`，它会校验确认文本并立刻返回 `task_id`。
 2. MCP 服务后台继续监控 Jenkins，并在成功/失败后发送邮件。
 3. 需要查看进度时调用 `get_release_task`。
+
+旧的 `release_and_notify_background` 仍然保留，适合需要手动传完整 Jenkins 参数的场景。
 
 ## 9. 故障排查
 

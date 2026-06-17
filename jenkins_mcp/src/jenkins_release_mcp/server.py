@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 from datetime import datetime, timezone
 import hmac
 import logging
@@ -33,6 +34,21 @@ from .models import (
     WaitReleaseNotifyResult,
 )
 from .notifier import EmailNotifier
+from .storage import ReleaseTaskStore
+
+
+MODULE_PARAM = "models"
+ACTIVE_RELEASE_STATUSES = {"triggering", "queued", "running", "retrying", "finishing"}
+SENSITIVE_PARAM_PATTERNS = ("token", "password", "secret", "key", "credential")
+FAILURE_KEYWORDS = (
+    "ERROR",
+    "Exception",
+    "Traceback",
+    "BUILD FAILURE",
+    "FAILED",
+    "npm ERR",
+    "Maven failure",
+)
 
 
 class JenkinsClientContext(Protocol):
@@ -91,11 +107,16 @@ class ReleaseRuntime:
         self._settings = settings
         self._client_factory = client_factory
         self._background_tasks: dict[str, BackgroundReleaseTask] = {}
+        self._task_store: ReleaseTaskStore | None = None
+        if settings is not None:
+            self._load_persisted_tasks()
 
     @property
     def settings(self) -> JenkinsSettings:
         if self._settings is None:
             self._settings = load_settings()
+        if self._task_store is None:
+            self._load_persisted_tasks()
         return self._settings
 
     def list_release_jobs(self) -> dict[str, Any]:
@@ -288,10 +309,12 @@ class ReleaseRuntime:
         queue_id: int | None = None,
         build_number: int | None = None,
         module: str | None = None,
+        notify_to: str | list[str] | None = None,
         timeout_seconds: int = 1800,
         poll_interval_seconds: int = 5,
     ) -> dict[str, Any]:
         job = self.get_allowed_job(job_name)
+        recipients = normalize_notify_to(notify_to)
         async with self._client_factory(self.settings) as client:
             wait_result = await client.wait_for_build(
                 job_name=job_name,
@@ -315,7 +338,7 @@ class ReleaseRuntime:
                         start_offset=0,
                         max_chars=8000,
                     )
-                    failure_log_excerpt = tail_text(log.text, 4000)
+                    failure_log_excerpt = summarize_failure_log(log.text, 4000)
             else:
                 branch = None
 
@@ -329,6 +352,7 @@ class ReleaseRuntime:
                 changes=changes,
                 failure_log_excerpt=failure_log_excerpt,
             ),
+            recipients=recipients or None,
         )
         return WaitReleaseNotifyResult(
             job_name=job_name,
@@ -344,6 +368,7 @@ class ReleaseRuntime:
         self,
         job_name: str,
         releases: list[dict[str, Any]],
+        notify_to: str | list[str] | None = None,
         timeout_seconds: int = 1800,
         poll_interval_seconds: int = 5,
     ) -> dict[str, Any]:
@@ -351,6 +376,7 @@ class ReleaseRuntime:
             raise ValueError("releases must not be empty.")
 
         job = self.get_allowed_job(job_name)
+        recipients = normalize_notify_to(notify_to)
         results: list[WaitMultiModuleNotifyItem] = []
         async with self._client_factory(self.settings) as client:
             for release in releases:
@@ -381,7 +407,7 @@ class ReleaseRuntime:
                             start_offset=0,
                             max_chars=8000,
                         )
-                        failure_log_excerpt = tail_text(log.text, 4000)
+                        failure_log_excerpt = summarize_failure_log(log.text, 4000)
                 else:
                     branch = None
 
@@ -400,6 +426,7 @@ class ReleaseRuntime:
         notification = EmailNotifier(self.settings.smtp).send(
             subject=build_multi_release_email_subject(job_name, results),
             body=build_multi_release_email_body(job_name, results),
+            recipients=recipients or None,
         )
         return WaitMultiModuleNotifyResult(
             job_name=job_name,
@@ -407,20 +434,71 @@ class ReleaseRuntime:
             notification=notification,
         ).model_dump()
 
-    async def list_recent_releases(self, job_name: str, limit: int = 10) -> dict[str, Any]:
+    async def list_recent_releases(
+        self,
+        job_name: str,
+        limit: int = 10,
+        module: str | None = None,
+        result: str | None = None,
+    ) -> dict[str, Any]:
         job = self.get_allowed_job(job_name)
         async with self._client_factory(self.settings) as client:
-            result = await client.list_recent_releases(job_name, job, limit)
-        return result.model_dump()
+            releases_result = await client.list_recent_releases(job_name, job, limit)
+        releases = releases_result.releases
+        if module:
+            releases = [
+                item
+                for item in releases
+                if any(param.name == MODULE_PARAM and param.value == module for param in item.parameters)
+            ]
+        if result:
+            expected_result = result.upper()
+            releases = [
+                item
+                for item in releases
+                if (item.result or "").upper() == expected_result
+            ]
+        return releases_result.model_copy(update={"releases": releases}).model_dump()
+
+    async def start_release(
+        self,
+        job_name: str,
+        module: str,
+        notify_to: str | list[str] | None = None,
+        confirm_text: str = "",
+        timeout_seconds: int = 1800,
+        poll_interval_seconds: float = 5,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        job_name = job_name.strip()
+        module = module.strip()
+        expected_confirm_text = f"确认发版 {job_name} {module}"
+        if confirm_text != expected_confirm_text:
+            raise ValueError(
+                "start_release requires confirm_text to exactly match: "
+                f"{expected_confirm_text}"
+            )
+        return await self.release_and_notify_background(
+            job_name=job_name,
+            params={MODULE_PARAM: module},
+            module=module,
+            notify_to=notify_to,
+            confirm=True,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            force=force,
+        )
 
     async def release_and_notify_background(
         self,
         job_name: str,
         params: Mapping[str, Any] | None = None,
         module: str | None = None,
+        notify_to: str | list[str] | None = None,
         confirm: bool = False,
         timeout_seconds: int = 1800,
         poll_interval_seconds: float = 5,
+        force: bool = False,
     ) -> dict[str, Any]:
         if not confirm:
             raise ValueError("Background release requires confirm=true.")
@@ -430,7 +508,10 @@ class ReleaseRuntime:
             raise ValueError("poll_interval_seconds must be greater than 0.")
 
         job, normalized_params = validate_release_request(self.settings, job_name, params or {})
-        module_name = module or normalized_params.get("models")
+        module_name = module or normalized_params.get(MODULE_PARAM)
+        recipients = normalize_notify_to(notify_to)
+        lock_key = build_release_lock_key(job_name, module_name, normalized_params)
+        self._ensure_no_active_release(lock_key, force)
         now = utc_now()
         task_id = uuid.uuid4().hex
         task = BackgroundReleaseTask(
@@ -438,7 +519,9 @@ class ReleaseRuntime:
             status="triggering",
             job_name=job_name,
             module=module_name,
-            params=normalized_params,
+            params=redact_params(normalized_params),
+            lock_key=lock_key,
+            notify_to=recipients,
             created_at=now,
             updated_at=now,
             message="正在触发 Jenkins 发版。",
@@ -469,6 +552,7 @@ class ReleaseRuntime:
                 task_id=task_id,
                 job_name=job_name,
                 module=module_name,
+                notify_to=recipients,
                 queue_id=queue_id,
                 timeout_seconds=timeout_seconds,
                 poll_interval_seconds=poll_interval_seconds,
@@ -482,14 +566,23 @@ class ReleaseRuntime:
             raise ValueError(f"Release task '{task_id}' was not found.")
         return BackgroundReleaseTaskResult(task=task).model_dump()
 
-    def list_release_tasks(self, limit: int = 20) -> dict[str, Any]:
+    def list_release_tasks(
+        self,
+        limit: int = 20,
+        job_name: str | None = None,
+        module: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
         if limit <= 0:
             raise ValueError("limit must be greater than 0.")
-        tasks = sorted(
-            self._background_tasks.values(),
-            key=lambda item: item.created_at,
-            reverse=True,
-        )[: min(limit, 100)]
+        tasks = list(self._background_tasks.values())
+        if job_name:
+            tasks = [task for task in tasks if task.job_name == job_name]
+        if module:
+            tasks = [task for task in tasks if task.module == module]
+        if status:
+            tasks = [task for task in tasks if task.status == status]
+        tasks = sorted(tasks, key=lambda item: item.created_at, reverse=True)[: min(limit, 100)]
         return BackgroundReleaseTasksResult(tasks=tasks).model_dump()
 
     async def _monitor_release_task(
@@ -497,6 +590,7 @@ class ReleaseRuntime:
         task_id: str,
         job_name: str,
         module: str | None,
+        notify_to: list[str],
         queue_id: int | None,
         timeout_seconds: int,
         poll_interval_seconds: float,
@@ -605,7 +699,7 @@ class ReleaseRuntime:
                         attempts=3,
                         delay_seconds=poll_interval_seconds,
                     )
-                    failure_log_excerpt = tail_text(log.text, 4000)
+                    failure_log_excerpt = summarize_failure_log(log.text, 4000)
 
             notification = EmailNotifier(self.settings.smtp).send(
                 subject=build_release_email_subject(job_name, module, wait_result),
@@ -617,6 +711,7 @@ class ReleaseRuntime:
                     changes=changes,
                     failure_log_excerpt=failure_log_excerpt,
                 ),
+                recipients=notify_to or None,
             )
             final_status = "success" if wait_result.result == "SUCCESS" else "failed"
             self._update_task(
@@ -638,6 +733,7 @@ class ReleaseRuntime:
                     f"后台任务：{task_id}\n"
                     f"异常信息：{exc}"
                 ),
+                recipients=notify_to or None,
             )
             self._update_task(
                 task_id,
@@ -649,6 +745,7 @@ class ReleaseRuntime:
 
     def _remember_task(self, task: BackgroundReleaseTask) -> None:
         self._background_tasks[task.task_id] = task
+        self._persist_task(task)
         if len(self._background_tasks) <= 100:
             return
         oldest = sorted(self._background_tasks.values(), key=lambda item: item.created_at)
@@ -658,7 +755,32 @@ class ReleaseRuntime:
     def _update_task(self, task_id: str, **updates: Any) -> None:
         task = self._background_tasks[task_id]
         updates["updated_at"] = utc_now()
-        self._background_tasks[task_id] = task.model_copy(update=updates)
+        updated_task = task.model_copy(update=updates)
+        self._background_tasks[task_id] = updated_task
+        self._persist_task(updated_task)
+
+    def _load_persisted_tasks(self) -> None:
+        if self._settings is None:
+            return
+        self._task_store = ReleaseTaskStore(self._settings.release_tasks_file)
+        self._background_tasks = self._task_store.load_latest()
+
+    def _persist_task(self, task: BackgroundReleaseTask) -> None:
+        if self._task_store is None:
+            self._load_persisted_tasks()
+        if self._task_store is not None:
+            self._task_store.append(task)
+
+    def _ensure_no_active_release(self, lock_key: str, force: bool) -> None:
+        if force:
+            return
+        for task in self._background_tasks.values():
+            if task.lock_key != lock_key or task.status not in ACTIVE_RELEASE_STATUSES:
+                continue
+            raise ValueError(
+                "A release for the same job/module is already active: "
+                f"task_id={task.task_id}, status={task.status}. Use force=true to override."
+            )
 
 
 def create_mcp(
@@ -773,6 +895,7 @@ def create_mcp(
         queue_id: int | None = None,
         build_number: int | None = None,
         module: str | None = None,
+        notify_to: str | list[str] | None = None,
         timeout_seconds: int = 1800,
         poll_interval_seconds: int = 5,
     ) -> dict[str, Any]:
@@ -782,6 +905,7 @@ def create_mcp(
             queue_id=queue_id,
             build_number=build_number,
             module=module,
+            notify_to=notify_to,
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )
@@ -790,6 +914,7 @@ def create_mcp(
     async def wait_multi_module_release_and_notify(
         job_name: str,
         releases: list[dict[str, Any]],
+        notify_to: str | list[str] | None = None,
         timeout_seconds: int = 1800,
         poll_interval_seconds: int = 5,
     ) -> dict[str, Any]:
@@ -797,32 +922,68 @@ def create_mcp(
         return await runtime.wait_multi_module_release_and_notify(
             job_name=job_name,
             releases=releases,
+            notify_to=notify_to,
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )
 
     @mcp.tool()
-    async def list_recent_releases(job_name: str, limit: int = 10) -> dict[str, Any]:
+    async def list_recent_releases(
+        job_name: str,
+        limit: int = 10,
+        module: str | None = None,
+        result: str | None = None,
+    ) -> dict[str, Any]:
         """List recent Jenkins releases for an allowlisted job."""
-        return await runtime.list_recent_releases(job_name=job_name, limit=limit)
+        return await runtime.list_recent_releases(
+            job_name=job_name,
+            limit=limit,
+            module=module,
+            result=result,
+        )
+
+    @mcp.tool()
+    async def start_release(
+        job_name: str,
+        module: str,
+        notify_to: str | list[str] | None = None,
+        confirm_text: str = "",
+        timeout_seconds: int = 1800,
+        poll_interval_seconds: float = 5,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Trigger one module release and let the MCP server monitor and email in the background."""
+        return await runtime.start_release(
+            job_name=job_name,
+            module=module,
+            notify_to=notify_to,
+            confirm_text=confirm_text,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            force=force,
+        )
 
     @mcp.tool()
     async def release_and_notify_background(
         job_name: str,
         params: dict[str, Any] | None = None,
         module: str | None = None,
+        notify_to: str | list[str] | None = None,
         confirm: bool = False,
         timeout_seconds: int = 1800,
         poll_interval_seconds: float = 5,
+        force: bool = False,
     ) -> dict[str, Any]:
         """Trigger a release and let the MCP server monitor and email in the background."""
         return await runtime.release_and_notify_background(
             job_name=job_name,
             params=params or {},
             module=module,
+            notify_to=notify_to,
             confirm=confirm,
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
+            force=force,
         )
 
     @mcp.tool()
@@ -831,9 +992,19 @@ def create_mcp(
         return runtime.get_release_task(task_id=task_id)
 
     @mcp.tool()
-    def list_release_tasks(limit: int = 20) -> dict[str, Any]:
+    def list_release_tasks(
+        limit: int = 20,
+        job_name: str | None = None,
+        module: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
         """List recent in-memory background release tasks."""
-        return runtime.list_release_tasks(limit=limit)
+        return runtime.list_release_tasks(
+            limit=limit,
+            job_name=job_name,
+            module=module,
+            status=status,
+        )
 
     return mcp
 
@@ -895,6 +1066,64 @@ def tail_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[-max_chars:]
+
+
+def summarize_failure_log(text: str, max_chars: int = 4000) -> str:
+    lines = text.splitlines()
+    keyword_blocks: list[str] = []
+    seen: set[int] = set()
+    for index, line in enumerate(lines):
+        if not any(keyword.lower() in line.lower() for keyword in FAILURE_KEYWORDS):
+            continue
+        start = max(0, index - 3)
+        end = min(len(lines), index + 4)
+        block_indexes = range(start, end)
+        block_lines = [lines[item] for item in block_indexes if item not in seen]
+        seen.update(block_indexes)
+        if block_lines:
+            keyword_blocks.append("\n".join(block_lines))
+    if keyword_blocks:
+        summary = "\n\n--- failure context ---\n".join(keyword_blocks)
+        tail = tail_text(text, min(1200, max_chars))
+        combined = f"失败关键词上下文：\n{summary}\n\n日志尾部：\n{tail}"
+        return tail_text(combined, max_chars)
+    return tail_text(text, max_chars)
+
+
+def normalize_notify_to(notify_to: str | list[str] | None) -> list[str]:
+    if notify_to is None:
+        return []
+    if isinstance(notify_to, str):
+        return [item.strip() for item in notify_to.split(",") if item.strip()]
+    recipients: list[str] = []
+    for item in notify_to:
+        value = str(item).strip()
+        if value:
+            recipients.append(value)
+    return recipients
+
+
+def build_release_lock_key(
+    job_name: str,
+    module: str | None,
+    normalized_params: Mapping[str, str],
+) -> str:
+    if module:
+        return f"job={job_name.strip()}|module={module.strip()}"
+    params_text = "&".join(f"{key}={normalized_params[key]}" for key in sorted(normalized_params))
+    params_hash = hashlib.sha256(params_text.encode("utf-8")).hexdigest()[:16]
+    return f"job={job_name.strip()}|params={params_hash}"
+
+
+def redact_params(params: Mapping[str, str]) -> dict[str, str]:
+    redacted: dict[str, str] = {}
+    for key, value in params.items():
+        key_lower = key.lower()
+        if any(pattern in key_lower for pattern in SENSITIVE_PARAM_PATTERNS):
+            redacted[key] = "***REDACTED***"
+        else:
+            redacted[key] = value
+    return redacted
 
 
 def utc_now() -> str:
