@@ -1,0 +1,6 @@
+.env
+prometheus_knowledge.json
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
